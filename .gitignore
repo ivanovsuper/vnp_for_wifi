@@ -1,0 +1,15 @@
+# Build artifacts
+socks5-cpp/server.exe
+socks5-cpp/CMakeFiles/
+socks5-cpp/build.ninja
+socks5-cpp/cmake_install.cmake
+socks5-cpp/CMakeCache.txt
+socks5-cpp/*.cmake
+socks5-cpp/*.dll.a
+socks5-cpp/*.pdb
+socks5-cpp/.ninja_log
+socks5-cpp/.ninja_deps
+
+# Python cache
+__pycache__/
+*.pyc
