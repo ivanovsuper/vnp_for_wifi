@@ -13,3 +13,6 @@ socks5-cpp/.ninja_deps
 # Python cache
 __pycache__/
 *.pyc
+socks5-cpp/ips.log
+socks5-cpp/silent_err.txt
+socks5-cpp/silent_out.txt

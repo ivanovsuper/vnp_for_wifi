@@ -21,8 +21,192 @@
 #include <string>
 #include <sstream>
 #include <chrono>
+#include <cstdio>
+#include <conio.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
+
+enum Verbosity { FULL, IP, SILENT };
+
+class Logger {
+    Verbosity level_;
+public:
+    Logger(Verbosity level = FULL) : level_(level) {}
+
+    void setLevel(Verbosity level) { level_ = level; }
+
+    void log(Verbosity msg_level, const std::string& msg) {
+        if (level_ != SILENT && msg_level >= level_) {
+            std::cout << msg << std::endl;
+        }
+    }
+
+    void error(const std::string& msg) {
+        if (level_ != SILENT) {
+            std::cerr << msg << std::endl;
+        }
+    }
+};
+
+static FILE* log_file = nullptr;
+static std::mutex file_mutex;
+
+struct Config {
+    enum Mode { LOG, SEND, UPLOAD } mode = SEND;
+    std::string log_path = "ips.log";
+    std::string config_path = "config.ini";
+    std::string router_host;
+    std::string router_user;
+    std::string router_pass;
+    bool new_log = false;
+    Verbosity verbosity = FULL;
+};
+
+void print_help() {
+    std::cout << "Использование: server.exe [ключи]\n"
+              << "\n"
+              << "Ключи:\n"
+              << "  -m, --mode <mode>    Режим: log, send, upload (default: send)\n"
+              << "  -i, --log-ips <path> Путь к лог-файлу (default: ips.log)\n"
+              << "  -r, --router <host>  Адрес MikroTik\n"
+              << "  -u, --user <user>    Имя пользователя MikroTik\n"
+              << "  -p, --pass <pass>    Пароль (если нет — запросим)\n"
+              << "  -c, --config <path>  Путь к config.ini (default: config.ini)\n"
+              << "  -v, --verbose <level> Уровень вывода: full, ip, silent (default: full)\n"
+              << "  -n, --new            Очистить лог-файл перед стартом\n"
+              << "  -h, --help           Эта справка\n"
+              << std::endl;
+}
+
+std::string read_password(const std::string& prompt) {
+    std::cout << prompt;
+    std::string pass;
+    int ch;
+    while ((ch = _getch()) != '\r' && ch != '\n') {
+        if (ch == 3) {
+            std::cout << std::endl;
+            exit(1);
+        }
+        if (ch == '\b' || ch == 127) {
+            if (!pass.empty()) {
+                pass.pop_back();
+                std::cout << "\b \b";
+            }
+        } else {
+            pass.push_back(static_cast<char>(ch));
+            std::cout << '*';
+        }
+    }
+    std::cout << std::endl;
+    return pass;
+}
+
+void parse_args(int argc, char* argv[], Config& cfg) {
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+
+        auto match = [&](const char* s, const char* l) {
+            return strcmp(a, s) == 0 || strcmp(a, l) == 0;
+        };
+        auto next = [&]() -> const char* {
+            if (++i >= argc) {
+                std::cerr << "Ошибка: " << a << " требует значение" << std::endl;
+                exit(1);
+            }
+            return argv[i];
+        };
+
+        if (match("-h", "--help")) {
+            print_help();
+            exit(0);
+        } else if (match("-m", "--mode")) {
+            const char* v = next();
+            if (strcmp(v, "log") == 0) cfg.mode = Config::LOG;
+            else if (strcmp(v, "send") == 0) cfg.mode = Config::SEND;
+            else if (strcmp(v, "upload") == 0) cfg.mode = Config::UPLOAD;
+            else {
+                std::cerr << "Неизвестный режим: " << v << " (log/send/upload)" << std::endl;
+                exit(1);
+            }
+        } else if (match("-i", "--log-ips")) {
+            cfg.log_path = next();
+        } else if (match("-r", "--router")) {
+            cfg.router_host = next();
+        } else if (match("-u", "--user")) {
+            cfg.router_user = next();
+        } else if (match("-p", "--pass")) {
+            cfg.router_pass = next();
+        } else if (match("-c", "--config")) {
+            cfg.config_path = next();
+        } else if (match("-n", "--new")) {
+            cfg.new_log = true;
+        } else if (match("-v", "--verbose")) {
+            const char* v = next();
+            if (strcmp(v, "full") == 0) cfg.verbosity = FULL;
+            else if (strcmp(v, "ip") == 0) cfg.verbosity = IP;
+            else if (strcmp(v, "silent") == 0) cfg.verbosity = SILENT;
+            else {
+                std::cerr << "Неизвестный уровень verbosity: " << v
+                          << " (full/ip/silent)" << std::endl;
+                exit(1);
+            }
+        } else {
+            std::cerr << "Неизвестный ключ: " << a << std::endl;
+            print_help();
+            exit(1);
+        }
+    }
+}
+
+bool read_config(const std::string& path, Config& cfg) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return false;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        if (strncmp(line, "host=", 5) == 0) cfg.router_host = line + 5;
+        else if (strncmp(line, "user=", 5) == 0) cfg.router_user = line + 5;
+        else if (strncmp(line, "pass=", 5) == 0) cfg.router_pass = line + 5;
+    }
+    fclose(f);
+    return true;
+}
+
+bool write_config(const std::string& path, const Config& cfg) {
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) return false;
+    fprintf(f, "[router]\n");
+    fprintf(f, "host=%s\n", cfg.router_host.c_str());
+    fprintf(f, "user=%s\n", cfg.router_user.c_str());
+    fprintf(f, "pass=%s\n", cfg.router_pass.c_str());
+    fclose(f);
+    return true;
+}
+
+void interactive_setup(Config& cfg) {
+    std::string input;
+
+    cfg.mode = Config::SEND;
+
+    std::cout << "MikroTik IP: ";
+    std::getline(std::cin, cfg.router_host);
+    std::cout << "Логин: ";
+    std::getline(std::cin, cfg.router_user);
+    if (cfg.router_pass.empty()) {
+        cfg.router_pass = read_password("Пароль: ");
+    }
+
+    std::cout << "Лог-файл [" << cfg.log_path << "]: ";
+    std::getline(std::cin, input);
+    if (!input.empty()) cfg.log_path = input;
+
+    write_config(cfg.config_path, cfg);
+    std::cout << "[+] Конфиг сохранён в " << cfg.config_path << std::endl;
+}
 
 // Константы протокола SOCKS5
 const int SOCKS5_VERSION = 5;
@@ -132,6 +316,30 @@ public:
     }
 };
 
+void run_upload(const std::string& path, MikroTikClient& client) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) {
+        std::cerr << "[-] Не удалось открыть " << path << std::endl;
+        return;
+    }
+
+    char line[64];
+    int total = 0, ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+
+        total++;
+        if (client.addAddress(line)) ok++;
+        else std::cerr << "[-] Ошибка отправки: " << line << std::endl;
+    }
+    fclose(f);
+
+    std::cout << "[+] Загрузка завершена: " << ok << "/" << total << " OK" << std::endl;
+}
+
 void upload_loop(IPCollector& collector, MikroTikClient& mikrotik) {
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -155,7 +363,7 @@ void upload_loop(IPCollector& collector, MikroTikClient& mikrotik) {
 // forward_data — пересылает данные из src в dst пока соединение открыто.
 // Читает из src, пишет в dst. send() может отправить не все байты,
 // поэтому нужен цикл досылки. При ошибке закрывает оба сокета.
-void forward_data(SOCKET src, SOCKET dst, const char* name) {
+void forward_data(SOCKET src, SOCKET dst, const char* name, Logger& log) {
     char buf[BUFFER_SIZE];
     int n;
     while ((n = recv(src, buf, BUFFER_SIZE, 0)) > 0) {
@@ -172,14 +380,14 @@ void forward_data(SOCKET src, SOCKET dst, const char* name) {
     }
     closesocket(src);
     closesocket(dst);
-    std::cout << "[-] " << name << " завершён" << std::endl;
+    log.log(FULL, std::string("[-] ") + name + " завершён");
 }
 
 // handle_client — обрабатывает одно SOCKS5-соединение.
 // Фаза 1: Handshake (выбор метода аутентификации)
 // Фаза 2: Запрос (извлечение целевого адреса и порта)
 // Фаза 3: Релей (двусторонняя пересылка данных)
-void handle_client(SOCKET client, IPCollector& collector) {
+void handle_client(SOCKET client, IPCollector& collector, Logger& log) {
     char buf[BUFFER_SIZE];
 
     // ---- Фаза 1: Handshake ----
@@ -200,7 +408,7 @@ void handle_client(SOCKET client, IPCollector& collector) {
     // Выбираем метод 0x00 (No Authentication)
     char handshake_response[] = {SOCKS5_VERSION, 0x00};
     send(client, handshake_response, 2, 0);
-    std::cout << "[+] Handshake пройден (no auth)" << std::endl;
+    log.log(FULL, "[+] Handshake пройден (no auth)");
 
     // ---- Фаза 2: Запрос ----
     // [VER=5, CMD=1(CONNECT), RSV=0, ATYP, DST.ADDR, DST.PORT]
@@ -212,7 +420,7 @@ void handle_client(SOCKET client, IPCollector& collector) {
 
     char atype = buf[3];
     if (atype != 0x01) {
-        std::cout << "[-] Поддерживается только IPv4" << std::endl;
+        log.log(FULL, "[-] Поддерживается только IPv4");
         closesocket(client);
         return;
     }
@@ -238,8 +446,13 @@ void handle_client(SOCKET client, IPCollector& collector) {
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &target_addr.sin_addr, ip_str, sizeof(ip_str));
     int port = ntohs(target_addr.sin_port);
-    std::cout << "[*] Цель: " << ip_str << ":" << port << std::endl;
+    log.log(IP, std::string("[*] Цель: ") + ip_str + ":" + std::to_string(port));
     collector.add(ip_str);
+    if (log_file) {
+        std::lock_guard<std::mutex> lock(file_mutex);
+        fprintf(log_file, "%s\n", ip_str);
+        fflush(log_file);
+    }
 
     // Подключаемся к цели через новый сокет
     SOCKET remote = socket(AF_INET, SOCK_STREAM, 0);
@@ -257,7 +470,7 @@ void handle_client(SOCKET client, IPCollector& collector) {
 
     if (connect(remote, (sockaddr*)&target_addr, sizeof(target_addr))
         == SOCKET_ERROR) {
-        std::cout << "[-] Не удалось подключиться к цели" << std::endl;
+        log.log(FULL, "[-] Не удалось подключиться к цели");
         closesocket(client);
         closesocket(remote);
         return;
@@ -268,30 +481,82 @@ void handle_client(SOCKET client, IPCollector& collector) {
     //  BND.ADDR=0.0.0.0, BND.PORT=0]
     char reply[] = {5, 0, 0, 1, 0, 0, 0, 0, 0, 0};
     send(client, reply, sizeof(reply), 0);
-    std::cout << "[+] Соединение с целью установлено, начинаю релей" << std::endl;
+    log.log(FULL, "[+] Соединение с целью установлено, начинаю релей");
 
     // ---- Фаза 3: Релей ----
     // Два потока для двусторонней пересылки данных
     // Каждый поток копирует данные из одного сокета в другой
-    std::thread(forward_data, client, remote, "клиент->цель").detach();
-    std::thread(forward_data, remote, client, "цель->клиент").detach();
+    std::thread(forward_data, client, remote, "клиент->цель", std::ref(log)).detach();
+    std::thread(forward_data, remote, client, "цель->клиент", std::ref(log)).detach();
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     SetConsoleOutputCP(CP_UTF8);
 
-    std::string mikrotik_host, mikrotik_user, mikrotik_pass;
-    std::cout << "MikroTik IP: ";
-    std::cin >> mikrotik_host;
-    std::cout << "Логин: ";
-    std::cin >> mikrotik_user;
-    std::cout << "Пароль: ";
-    std::cin >> mikrotik_pass;
+    Config cfg;
+    bool has_cli_flags = argc > 1;
+
+    // Always try config first (provides defaults for CLI override)
+    bool config_found = read_config(cfg.config_path, cfg);
+
+    // CLI flags override config values
+    if (has_cli_flags) {
+        parse_args(argc, argv, cfg);
+    }
+
+    Logger log(cfg.verbosity);
+
+    // Without CLI flags: use config or interactive
+    if (!has_cli_flags && config_found) {
+        log.log(IP, "[+] Конфиг загружен: " + cfg.config_path);
+        cfg.mode = Config::SEND;
+        if (cfg.router_pass.empty()) {
+            cfg.router_pass = read_password("Пароль: ");
+        }
+    }
+
+    if (!has_cli_flags && !config_found) {
+        interactive_setup(cfg);
+    }
+
+    // --new: clear log file
+    if (cfg.new_log) {
+        FILE* f = fopen(cfg.log_path.c_str(), "w");
+        if (f) fclose(f);
+        log.log(FULL, "[+] Лог-файл очищен: " + cfg.log_path);
+    }
+
+    // Upload mode: one-shot, no server
+    if (cfg.mode == Config::UPLOAD) {
+        if (cfg.router_host.empty()) {
+            std::cerr << "[-] Укажите адрес MikroTik (--router) для режима upload"
+                      << std::endl;
+            return 1;
+        }
+        MikroTikClient mikrotik(cfg.router_host, cfg.router_user, cfg.router_pass);
+        run_upload(cfg.log_path, mikrotik);
+        return 0;
+    }
+
+    // Server modes: LOG or SEND
+    log_file = fopen(cfg.log_path.c_str(), "a");
+    if (!log_file) {
+        std::cerr << "[-] Не удалось открыть " << cfg.log_path << " для записи"
+                  << std::endl;
+    }
 
     IPCollector collector;
-    MikroTikClient mikrotik(mikrotik_host, mikrotik_user, mikrotik_pass);
-    std::thread upload(upload_loop, std::ref(collector), std::ref(mikrotik));
-    upload.detach();
+
+    if (cfg.mode == Config::SEND) {
+        if (cfg.router_host.empty()) {
+            std::cerr << "[-] Укажите адрес MikroTik (--router) для режима send"
+                      << std::endl;
+            return 1;
+        }
+        MikroTikClient mikrotik(cfg.router_host, cfg.router_user, cfg.router_pass);
+        std::thread upload(upload_loop, std::ref(collector), std::ref(mikrotik));
+        upload.detach();
+    }
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -325,8 +590,7 @@ int main() {
         return 1;
     }
 
-    std::cout << "[+] SOCKS5 сервер запущен на 0.0.0.0:"
-              << DEFAULT_PORT << std::endl;
+    log.log(IP, "[+] SOCKS5 сервер запущен на 0.0.0.0:" + std::to_string(DEFAULT_PORT));
 
     while (true) {
         SOCKET client = accept(server, nullptr, nullptr);
@@ -334,8 +598,8 @@ int main() {
             std::cerr << "[-] Ошибка accept()" << std::endl;
             continue;
         }
-        std::cout << "[*] Новое соединение" << std::endl;
-        std::thread(handle_client, client, std::ref(collector)).detach();
+        log.log(FULL, "[*] Новое соединение");
+        std::thread(handle_client, client, std::ref(collector), std::ref(log)).detach();
     }
 
     closesocket(server);
